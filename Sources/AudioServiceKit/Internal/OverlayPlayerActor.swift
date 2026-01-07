@@ -143,7 +143,7 @@ actor OverlayPlayerActor {
       try file.read(into: directBuffer)
 
       if configuration.normalized {
-        buffer = directBuffer.normalize()
+        buffer = try directBuffer.normalizeEBUR128().output
       } else {
         buffer = directBuffer
       }
