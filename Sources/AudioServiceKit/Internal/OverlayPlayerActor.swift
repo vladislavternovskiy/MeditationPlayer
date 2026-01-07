@@ -6,7 +6,7 @@
 //  Overlay Player
 //
 
-import AVFoundation
+@preconcurrency import AVFoundation
 import AudioServiceCore
 import os.log
 

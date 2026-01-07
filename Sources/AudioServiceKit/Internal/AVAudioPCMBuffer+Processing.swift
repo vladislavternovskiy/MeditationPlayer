@@ -37,7 +37,7 @@ extension AVAudioPCMBuffer {
     ///   - outputSampleRate: e.g. 44_100
     ///   - maxIterations: allows small correction after limiting
     func normalizedEBUR128(
-        targetIntegratedLUFS: Double = -16.0,
+        targetIntegratedLUFS: Double = -13.0,
         maxTruePeakDBTP: Double = -1.0,
         outputSampleRate: Double = 44_100,
         maxIterations: Int = 3,
