@@ -1871,7 +1871,7 @@ actor AudioEngineActor {
     /// Resume overlay playback
     func resumeOverlay() async {
         guard let player = overlayPlayer else { return }
-        try? await player.resume()
+        await player.resume()
     }
 
     /// Set overlay volume independently

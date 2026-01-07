@@ -92,6 +92,9 @@ public struct OverlayConfiguration: Sendable, Equatable {
   /// - SeeAlso: `FadeCurve` for available curve types
   public var fadeCurve: FadeCurve
 
+  /// Use a normalized buffer
+  public var normalized: Bool
+
   // MARK: - Initialization
 
   /// Creates a new overlay configuration with default values.
@@ -109,7 +112,8 @@ public struct OverlayConfiguration: Sendable, Equatable {
     volume: Float = 1.0,
     fadeInDuration: TimeInterval = 0.0,
     fadeOutDuration: TimeInterval = 0.0,
-    fadeCurve: FadeCurve = .linear
+    fadeCurve: FadeCurve = .linear,
+    normalized: Bool = true
   ) {
     self.loopMode = loopMode
     self.loopDelay = loopDelay
@@ -117,6 +121,7 @@ public struct OverlayConfiguration: Sendable, Equatable {
     self.fadeInDuration = fadeInDuration
     self.fadeOutDuration = fadeOutDuration
     self.fadeCurve = fadeCurve
+    self.normalized = normalized
   }
 
   // MARK: - Validation

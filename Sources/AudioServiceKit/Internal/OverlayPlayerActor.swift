@@ -62,6 +62,9 @@ actor OverlayPlayerActor {
   /// Loaded audio file
   private var audioFile: AVAudioFile?
 
+  /// Loaded audio buffer (loaded into RAM)
+  private var buffer: AVAudioPCMBuffer?
+
   /// Current configuration
   private var configuration: OverlayConfiguration
 
@@ -131,6 +134,18 @@ actor OverlayPlayerActor {
       let duration = Double(file.length) / file.fileFormat.sampleRate
       audioFile = file
       state = .idle  // Ready to play
+        if configuration.normalized {
+          guard let directBuffer = AVAudioPCMBuffer(
+              pcmFormat: file.processingFormat,
+              frameCapacity: AVAudioFrameCount(file.length)
+          ) else {
+              throw AudioPlayerError.fileLoadFailed(reason: "Cannot create audio buffer for \(url.lastPathComponent)")
+          }
+          try file.read(into: directBuffer)
+          buffer = directBuffer.normalize()
+      } else {
+          buffer = nil
+      }
       Logger.audio.info("[Overlay] File loaded: \(url.lastPathComponent) (\(String(format: "%.2f", duration))s, \(file.length) frames @ \(Int(file.fileFormat.sampleRate))Hz)")
     } catch {
       state = .idle
@@ -170,6 +185,11 @@ actor OverlayPlayerActor {
     Logger.audio.info("[Overlay] ▶️ Starting playback (loopMode: \(String(describing: configuration.loopMode)), fadeIn: \(String(format: "%.2f", configuration.fadeInDuration))s, fadeOut: \(String(format: "%.2f", configuration.fadeOutDuration))s)")
     state = .playing
     loopCount = 0
+
+    // Schedule buffer for playback
+      if let buffer {
+          await player.scheduleBuffer(buffer)
+      }
 
     // Start loop cycle
     loopTask = Task {
