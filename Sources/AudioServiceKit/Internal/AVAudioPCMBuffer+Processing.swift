@@ -45,7 +45,7 @@ public extension AVAudioPCMBuffer {
     func normalizeEBUR128(
         targetIntegratedLUFS: Float = -16.0,
         truePeakLimitDBTP: Float = -1.0,
-        loudnessMeasurementSampleRate: Double = 48_000,
+        loudnessMeasurementSampleRate: Double = 44_100,
         truePeakMeasurementSampleRate: Double = 192_000
     ) throws -> LoudnessNormalizationResult {
 
@@ -57,7 +57,7 @@ public extension AVAudioPCMBuffer {
 
         // 3) Compute gain needed for loudness target.
         let gainDBForLoudness = targetIntegratedLUFS - lufs
-        let gainForLoudness = Self.dbToLinear(gainDBForLoudness)
+        _ = Self.dbToLinear(gainDBForLoudness)
 
         // Predict TP after gain (linear scaling => dB adds).
         let predictedTP = tp + gainDBForLoudness
@@ -168,7 +168,7 @@ public extension AVAudioPCMBuffer {
     /// K-weighting filter per ITU-R BS.1770 (48 kHz coefficients), applied in-place on a copy.
     private func kWeighted48kInPlaceCopy() throws -> AVAudioPCMBuffer {
         let sr = format.sampleRate
-        guard abs(sr - 48_000) < 0.5 else {
+        guard abs(sr - 44_100) < 0.5 else {
             // This method expects the buffer already converted to 48 kHz.
             throw LoudnessNormalizationError.conversionFailed("Expected 48 kHz for K-weighting coefficients.")
         }
@@ -179,7 +179,7 @@ public extension AVAudioPCMBuffer {
         }
 
         // Stage 1 coefficients (Table 1, 48 kHz)
-        var s1 = Biquad(
+        let s1 = Biquad(
             b0:  1.53512485958697,
             b1: -2.69169618940638,
             b2:  1.19839281085285,
@@ -188,7 +188,7 @@ public extension AVAudioPCMBuffer {
         )
 
         // Stage 2 coefficients (Table 2, 48 kHz)
-        var s2 = Biquad(
+        let s2 = Biquad(
             b0:  1.0,
             b1: -2.0,
             b2:  1.0,
@@ -314,7 +314,7 @@ public extension AVAudioPCMBuffer {
             let channels = Int(format.channelCount)
             let n = Int(frameLength)
             for ch in 0..<channels {
-                dst[ch].assign(from: src[ch], count: n)
+                dst[ch].update(from: src[ch], count: n)
             }
             return out
         }
