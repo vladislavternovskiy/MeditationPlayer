@@ -187,11 +187,6 @@ actor OverlayPlayerActor {
     state = .playing
     loopCount = 0
 
-    // Schedule buffer for playback
-      if let buffer {
-          await player.scheduleBuffer(buffer)
-      }
-
     // Start loop cycle
     loopTask = Task {
       await self.loopCycle()
@@ -596,23 +591,81 @@ actor OverlayPlayerActor {
   /// - Schedules entire file at once (no progressive loading)
   /// - Sets up completion callback to signal `waitForPlaybackEnd()`
   /// - Callback executes on audio thread - uses Task to hop back to actor
-  private func scheduleBuffer() {
-    guard let file = audioFile else { return }
+    private func scheduleBuffer() {
+      guard let sourceBuffer = buffer else { return }
 
-    let fileLength = file.length
-    let sampleRate = file.fileFormat.sampleRate
-    let expectedDuration = Double(fileLength) / sampleRate
-    Logger.audio.debug("[Overlay] 📄 Scheduling buffer: \(fileLength) frames (expected: \(String(format: "%.3f", expectedDuration))s)")
+      let nodeFormat = player.outputFormat(forBus: 0)
 
-    // Schedule entire file
-    player.scheduleFile(file, at: nil) { [weak self] in
-      // Completion on audio thread - signal continuation
-      guard let self = self else { return }
-      Task {
-        await self.signalPlaybackEnd()
+      // Debug once if needed
+      if sourceBuffer.format.channelCount != nodeFormat.channelCount ||
+          sourceBuffer.format.sampleRate != nodeFormat.sampleRate {
+        Logger.audio.warning("""
+        [Overlay] Format mismatch. buffer=\(sourceBuffer.format), node=\(nodeFormat).
+        Converting to node format.
+        """)
+      }
+
+      let playableBuffer: AVAudioPCMBuffer
+      do {
+        playableBuffer = try convertBufferIfNeeded(sourceBuffer, to: nodeFormat)
+      } catch {
+        Logger.audio.error("[Overlay] Buffer conversion failed: \(error.localizedDescription)")
+        // Fallback: do NOT schedule the mismatched buffer (would crash).
+        // If you prefer, you can early-return here.
+        return
+      }
+
+      player.scheduleBuffer(playableBuffer, at: nil, options: []) { [weak self] in
+        guard let self else { return }
+        Task { await self.signalPlaybackEnd() }
       }
     }
-  }
+
+    private func convertBufferIfNeeded(
+      _ buffer: AVAudioPCMBuffer,
+      to targetFormat: AVAudioFormat
+    ) throws -> AVAudioPCMBuffer {
+      // Exact match: return as-is
+      if buffer.format.channelCount == targetFormat.channelCount,
+         buffer.format.sampleRate == targetFormat.sampleRate,
+         buffer.format.commonFormat == targetFormat.commonFormat,
+         buffer.format.isInterleaved == targetFormat.isInterleaved {
+        return buffer
+      }
+
+      guard let converter = AVAudioConverter(from: buffer.format, to: targetFormat) else {
+        throw NSError(domain: "OverlayPlayerActor", code: -1, userInfo: [
+          NSLocalizedDescriptionKey: "Cannot create AVAudioConverter from \(buffer.format) to \(targetFormat)"
+        ])
+      }
+
+      let ratio = targetFormat.sampleRate / buffer.format.sampleRate
+      let outCapacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio + 1)
+
+      guard let outBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outCapacity) else {
+        throw NSError(domain: "OverlayPlayerActor", code: -2, userInfo: [
+          NSLocalizedDescriptionKey: "Cannot allocate output buffer for target format \(targetFormat)"
+        ])
+      }
+
+      var error: NSError?
+      var didProvideInput = false
+
+      converter.convert(to: outBuffer, error: &error) { _, outStatus in
+        if didProvideInput {
+          outStatus.pointee = .endOfStream
+          return nil
+        } else {
+          didProvideInput = true
+          outStatus.pointee = .haveData
+          return buffer
+        }
+      }
+
+      if let error { throw error }
+      return outBuffer
+    }
+
 
   /// Wait for buffer playback to complete.
   ///
