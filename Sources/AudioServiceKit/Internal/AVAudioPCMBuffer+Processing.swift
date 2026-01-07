@@ -6,403 +6,456 @@
 //
 
 @preconcurrency import AVFoundation
-import Accelerate
 import os.log
 
-public extension AVAudioPCMBuffer {
+enum EBUR128NormalizationError: Error {
+    case emptyBuffer
+    case unsupportedFormat(String)
+    case converterInitFailed
+    case conversionFailed
+}
 
-    // MARK: - Types
+// MARK: - Public API
 
-    struct LoudnessNormalizationResult: Sendable {
-        public let output: AVAudioPCMBuffer
-        public let inputIntegratedLUFS: Float
-        public let inputTruePeakDBTP: Float
-        public let appliedGainDB: Float
-        public let outputEstimatedIntegratedLUFS: Float
-        public let outputEstimatedTruePeakDBTP: Float
-        public let limitedByTruePeak: Bool
+extension AVAudioPCMBuffer {
+
+    /// Returns a new buffer resampled to `sampleRate` as Float32, non-interleaved.
+    func resampled(to sampleRate: Double = 44_100) throws -> AVAudioPCMBuffer {
+        let outFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                      sampleRate: sampleRate,
+                                      channels: format.channelCount,
+                                      interleaved: false)!
+        return try AudioBufferConverter.convert(self, to: outFormat)
     }
 
-    enum LoudnessNormalizationError: Error {
-        case unsupportedFormat
-        case conversionFailed(String)
-        case silenceOrNoGatedBlocks
-    }
-
-    // MARK: - Public API
-
-    /// Loudness-normalize to EBU R128 / ITU-R BS.1770 integrated loudness (LUFS) with a true-peak ceiling (dBTP).
-    ///
-    /// - Important:
-    ///   This performs *linear gain* only. If the true-peak ceiling constrains the gain, output loudness can end up
-    ///   lower than the target (a true-peak limiter is required to satisfy both simultaneously in all cases).
+    /// Normalizes to Integrated Loudness (LUFS) and Maximum True Peak (dBTP) using an offline
+    /// BS.1770/EBU R128 style measurement + oversampled true-peak limiting.
     ///
     /// - Parameters:
-    ///   - targetIntegratedLUFS: Target integrated loudness, e.g. `-16`.
-    ///   - truePeakLimitDBTP: True-peak ceiling, e.g. `-1`.
-    ///   - loudnessMeasurementSampleRate: Sample rate used for LUFS measurement (default 48 kHz).
-    ///   - truePeakMeasurementSampleRate: Sample rate used for true-peak measurement (default 192 kHz).
-    func normalizeEBUR128(
-        targetIntegratedLUFS: Float = -16.0,
-        truePeakLimitDBTP: Float = -1.0,
-        loudnessMeasurementSampleRate: Double = 44_100,
-        truePeakMeasurementSampleRate: Double = 192_000
-    ) throws -> LoudnessNormalizationResult {
+    ///   - targetIntegratedLUFS: e.g. -16.0
+    ///   - maxTruePeakDBTP: e.g. -1.0
+    ///   - outputSampleRate: e.g. 44_100
+    ///   - maxIterations: allows small correction after limiting
+    func normalizedEBUR128(
+        targetIntegratedLUFS: Double = -16.0,
+        maxTruePeakDBTP: Double = -1.0,
+        outputSampleRate: Double = 44_100,
+        maxIterations: Int = 3,
+        loudnessToleranceLU: Double = 0.1
+    ) throws -> AVAudioPCMBuffer {
 
-        // 1) Measure integrated loudness (LUFS) on 48 kHz float, K-weighted + gated.
-        let lufs = try measureIntegratedLUFS(measurementSampleRate: loudnessMeasurementSampleRate)
+        guard frameLength > 0 else { throw EBUR128NormalizationError.emptyBuffer }
 
-        // 2) Measure true peak (dBTP) using 192 kHz upsampled peak.
-        let tp = try measureTruePeakDBTP(measurementSampleRate: truePeakMeasurementSampleRate)
+        // Ensure Float32 @ 44.1kHz (as requested).
+        var working = try self.resampled(to: outputSampleRate)
 
-        // 3) Compute gain needed for loudness target.
-        let gainDBForLoudness = targetIntegratedLUFS - lufs
-        _ = Self.dbToLinear(gainDBForLoudness)
+        for _ in 0..<maxIterations {
+            let currentLUFS = try BS1770Meter.integratedLUFS(of: working)
+            if currentLUFS.isNaN || currentLUFS.isInfinite { break }
 
-        // Predict TP after gain (linear scaling => dB adds).
-        let predictedTP = tp + gainDBForLoudness
+            let gainDB = targetIntegratedLUFS - currentLUFS
+            AudioDSP.applyGain(in: working, gainDB: gainDB)
 
-        // 4) If TP would exceed ceiling, cap the gain.
-        let limitedByTP = predictedTP > truePeakLimitDBTP
-        let finalGainDB: Float
-        if limitedByTP {
-            finalGainDB = truePeakLimitDBTP - tp
-        } else {
-            finalGainDB = gainDBForLoudness
+            working = try TruePeakLimiter.limit(buffer: working,
+                                                ceilingDBTP: maxTruePeakDBTP,
+                                                oversampleFactor: 4)
+
+            let afterLUFS = try BS1770Meter.integratedLUFS(of: working)
+            let afterTP = try TruePeakMeter.truePeakDBTP(of: working, oversampleFactor: 4)
+
+            if abs(afterLUFS - targetIntegratedLUFS) <= loudnessToleranceLU && afterTP <= maxTruePeakDBTP {
+                break
+            }
         }
-        let finalGain = Self.dbToLinear(finalGainDB)
 
-        // 5) Apply gain to original format buffer.
-        let out = try applyingLinearGain(finalGain)
-
-        return LoudnessNormalizationResult(
-            output: out,
-            inputIntegratedLUFS: lufs,
-            inputTruePeakDBTP: tp,
-            appliedGainDB: finalGainDB,
-            outputEstimatedIntegratedLUFS: lufs + finalGainDB,
-            outputEstimatedTruePeakDBTP: tp + finalGainDB,
-            limitedByTruePeak: limitedByTP
-        )
+        return working
     }
+}
 
-    // MARK: - Integrated LUFS (EBU R128 / BS.1770 gating)
+// MARK: - Conversion
 
-    private func measureIntegratedLUFS(measurementSampleRate: Double) throws -> Float {
-        let measured = try convertedToFloat32NonInterleaved(sampleRate: measurementSampleRate)
-        let filtered = try measured.kWeighted48kInPlaceCopy()
+private enum AudioBufferConverter {
 
-        let sr = filtered.format.sampleRate
-        let frameCount = Int(filtered.frameLength)
-        let channels = Int(filtered.format.channelCount)
-
-        // Gating blocks: 400 ms with 75% overlap => 100 ms step.
-        let blockSize = Int((0.400 * sr).rounded()) // nearest sample
-        let stepSize  = Int((0.100 * sr).rounded()) // 25% of block duration
-
-        guard blockSize > 0, stepSize > 0, frameCount >= blockSize else {
-            throw LoudnessNormalizationError.silenceOrNoGatedBlocks
-        }
-        guard let chData = filtered.floatChannelData else {
-            throw LoudnessNormalizationError.unsupportedFormat
+    static func convert(_ buffer: AVAudioPCMBuffer, to outFormat: AVAudioFormat) throws -> AVAudioPCMBuffer {
+        guard let converter = AVAudioConverter(from: buffer.format, to: outFormat) else {
+            throw EBUR128NormalizationError.converterInitFailed
         }
 
-        let weights = channelWeightsForITU1770(channelCount: channels)
+        let ratio = outFormat.sampleRate / buffer.format.sampleRate
+        let estimatedFrames = Int(ceil(Double(buffer.frameLength) * ratio))
+        let outCapacity = AVAudioFrameCount(max(estimatedFrames + 4096, 4096))
 
-        // For each block j, compute SumWeightedMS[j] = Σ_i Gi * meanSquare(block(i,j))
-        var sumWeightedMS: [Float] = []
-        sumWeightedMS.reserveCapacity((frameCount - blockSize) / stepSize + 1)
+        guard let outBuffer = AVAudioPCMBuffer(pcmFormat: outFormat, frameCapacity: outCapacity) else {
+            throw EBUR128NormalizationError.conversionFailed
+        }
 
-        var start = 0
-        while start + blockSize <= frameCount {
-            var sum: Float = 0
+        var didProvideInput = false
+        var error: NSError?
 
+        converter.convert(to: outBuffer, error: &error) { _, outStatus in
+            if didProvideInput {
+                outStatus.pointee = .endOfStream
+                return nil
+            }
+            didProvideInput = true
+            outStatus.pointee = .haveData
+            return buffer
+        }
+
+        if let error { throw error }
+        return outBuffer
+    }
+}
+
+// MARK: - Loudness Meter (BS.1770 integrated, gated)
+
+private enum BS1770Meter {
+
+    /// Integrated loudness (LUFS) using:
+    /// - K-weighting filter
+    /// - 400 ms blocks with 75% overlap (100 ms step)
+    /// - absolute gate at -70 LUFS
+    /// - relative gate at -10 LU below the ungated average of gated blocks
+    static func integratedLUFS(of buffer: AVAudioPCMBuffer) throws -> Double {
+        guard buffer.format.commonFormat == .pcmFormatFloat32,
+              let floatData = buffer.floatChannelData
+        else { throw EBUR128NormalizationError.unsupportedFormat("Expected Float32 non-interleaved buffer.") }
+
+        let sr = buffer.format.sampleRate
+        let channels = Int(buffer.format.channelCount)
+        let frames = Int(buffer.frameLength)
+
+        // Typical mono/stereo case: weight 1.0 each channel (LFE exclusion requires layout-aware mapping).
+        let weights = Array(repeating: 1.0, count: channels)
+
+        let coeffs = KWeightingCoefficients(sampleRate: sr)
+        var states = Array(repeating: KWeightingState(), count: channels)
+
+        // 400 ms window with 100 ms step (75% overlap).
+        let window = max(1, Int((sr * 0.4).rounded()))
+        let step = max(1, Int((sr * 0.1).rounded()))
+
+        // If shorter than one 400ms window, fall back to ungated loudness over the whole buffer.
+        if frames < window {
+            let energy = try meanSquareEnergyOverWholeSignal(floatData: floatData,
+                                                             frames: frames,
+                                                             channels: channels,
+                                                             weights: weights,
+                                                             coeffs: coeffs,
+                                                             states: &states)
+            return energyToLUFS(energy)
+        }
+
+        var ring = Array(repeating: 0.0, count: window)
+        var ringIndex = 0
+        var runningSum = 0.0
+
+        var blockEnergies: [Double] = []
+        blockEnergies.reserveCapacity(max(1, frames / step))
+
+        for i in 0..<frames {
+            var s = 0.0
             for ch in 0..<channels {
-                let ptr = chData[ch].advanced(by: start)
-
-                var ms: Float = 0
-                vDSP_measqv(ptr, 1, &ms, vDSP_Length(blockSize))
-
-                sum += weights[ch] * ms
+                let x = Double(floatData[ch][i])
+                let y = coeffs.process(x, state: &states[ch])
+                s += weights[ch] * (y * y)
             }
 
-            sumWeightedMS.append(sum)
-            start += stepSize
+            runningSum -= ring[ringIndex]
+            ring[ringIndex] = s
+            runningSum += s
+            ringIndex = (ringIndex + 1) % window
+
+            if i >= window - 1 {
+                let blockIndex = i - (window - 1)
+                if blockIndex % step == 0 {
+                    blockEnergies.append(runningSum / Double(window))
+                }
+            }
         }
 
-        func blockLUFS(_ ms: Float) -> Float {
-            guard ms > 0 else { return -.infinity }
-            return -0.691 + 10.0 * log10f(ms)
-        }
+        // Absolute gate at -70 LUFS.
+        let absGated = blockEnergies.filter { energyToLUFS($0) >= -70.0 }
+        guard !absGated.isEmpty else { return -Double.infinity }
 
-        // Absolute gate Γa = -70 LKFS (≈ LUFS).
-        let gammaA: Float = -70.0
-        let blockLufs = sumWeightedMS.map(blockLUFS)
-        let jAbs = blockLufs.indices.filter { blockLufs[$0] > gammaA }
+        let absMean = absGated.reduce(0.0, +) / Double(absGated.count)
 
-        guard !jAbs.isEmpty else {
-            throw LoudnessNormalizationError.silenceOrNoGatedBlocks
-        }
+        // Relative gate: -10 LU => energy factor 10^(-10/10) = 0.1
+        let relativeThreshold = absMean * pow(10.0, -10.0 / 10.0)
+        let relGated = absGated.filter { $0 >= relativeThreshold }
+        guard !relGated.isEmpty else { return -Double.infinity }
 
-        func gatedIntegratedLUFS(indices: [Int]) -> Float {
-            var avg: Float = 0
-            let inv = 1.0 as Float / Float(indices.count)
-            for j in indices { avg += sumWeightedMS[j] * inv }
-            guard avg > 0 else { return -.infinity }
-            return -0.691 + 10.0 * log10f(avg)
-        }
-
-        // Relative gate Γr = L_abs - 10.
-        let lAbs = gatedIntegratedLUFS(indices: jAbs)
-        let gammaR = lAbs - 10.0
-
-        let jFinal = blockLufs.indices.filter { blockLufs[$0] > gammaA && blockLufs[$0] > gammaR }
-        guard !jFinal.isEmpty else {
-            // If relative gate removes everything, fall back to absolute-gated loudness.
-            return lAbs
-        }
-
-        return gatedIntegratedLUFS(indices: jFinal)
+        let gatedMean = relGated.reduce(0.0, +) / Double(relGated.count)
+        return energyToLUFS(gatedMean)
     }
 
-    /// K-weighting filter per ITU-R BS.1770 (48 kHz coefficients), applied in-place on a copy.
-    private func kWeighted48kInPlaceCopy() throws -> AVAudioPCMBuffer {
-        let sr = format.sampleRate
-        guard abs(sr - 44_100) < 0.5 else {
-            // This method expects the buffer already converted to 48 kHz.
-            throw LoudnessNormalizationError.conversionFailed("Expected 48 kHz for K-weighting coefficients.")
+    private static func meanSquareEnergyOverWholeSignal(
+        floatData: UnsafePointer<UnsafeMutablePointer<Float>>,
+        frames: Int,
+        channels: Int,
+        weights: [Double],
+        coeffs: KWeightingCoefficients,
+        states: inout [KWeightingState]
+    ) throws -> Double {
+        guard frames > 0 else { return 0.0 }
+        var sum = 0.0
+        for i in 0..<frames {
+            var s = 0.0
+            for ch in 0..<channels {
+                let x = Double(floatData[ch][i])
+                let y = coeffs.process(x, state: &states[ch])
+                s += weights[ch] * (y * y)
+            }
+            sum += s
         }
-        let copy = try copiedBuffer()
+        return sum / Double(frames)
+    }
 
-        guard let chData = copy.floatChannelData else {
-            throw LoudnessNormalizationError.unsupportedFormat
-        }
+    // BS.1770 loudness calibration uses -0.691 offset (energy -> LUFS).
+    private static func energyToLUFS(_ e: Double) -> Double {
+        guard e > 0 else { return -Double.infinity }
+        return 10.0 * log10(e) - 0.691
+    }
+}
 
-        // Stage 1 coefficients (Table 1, 48 kHz)
-        let s1 = Biquad(
-            b0:  1.53512485958697,
-            b1: -2.69169618940638,
-            b2:  1.19839281085285,
-            a1: -1.69065929318241,
-            a2:  0.73248077421585
-        )
+// MARK: - K-weighting (sample-rate aware)
 
-        // Stage 2 coefficients (Table 2, 48 kHz)
-        let s2 = Biquad(
-            b0:  1.0,
-            b1: -2.0,
-            b2:  1.0,
-            a1: -1.99004745483398,
-            a2:  0.99007225036621
-        )
+private struct KWeightingCoefficients {
+    let b: [Double] // b0..b4
+    let a: [Double] // a0..a4
 
-        let channels = Int(copy.format.channelCount)
-        let n = Int(copy.frameLength)
+    /// Sample-rate aware coefficient derivation (used by libebur128/FFmpeg for BS.1770).
+    init(sampleRate fs: Double) {
+        // Shelving stage
+        var f0 = 1681.974450955533
+        let G = 3.999843853973347
+        var Q = 0.7071752369554196
+
+        var K = tan(Double.pi * f0 / fs)
+        let Vh = pow(10.0, G / 20.0)
+        let Vb = pow(Vh, 0.4996667741545416)
+
+        let a0 = 1.0 + K / Q + K * K
+        let pb0 = (Vh + Vb * K / Q + K * K) / a0
+        let pb1 = 2.0 * (K * K - Vh) / a0
+        let pb2 = (Vh - Vb * K / Q + K * K) / a0
+        let pa0 = 1.0
+        let pa1 = 2.0 * (K * K - 1.0) / a0
+        let pa2 = (1.0 - K / Q + K * K) / a0
+
+        // RLB high-pass stage
+        f0 = 38.13547087602444
+        Q = 0.5003270373238773
+        K = tan(Double.pi * f0 / fs)
+
+        let rb0 = 1.0, rb1 = -2.0, rb2 = 1.0
+        let ra0 = 1.0
+        let ra1 = 2.0 * (K * K - 1.0) / (1.0 + K / Q + K * K)
+        let ra2 = (1.0 - K / Q + K * K) / (1.0 + K / Q + K * K)
+
+        // Convolution => 4th order IIR
+        let b0 = pb0 * rb0
+        let b1 = pb0 * rb1 + pb1 * rb0
+        let b2 = pb0 * rb2 + pb1 * rb1 + pb2 * rb0
+        let b3 = pb1 * rb2 + pb2 * rb1
+        let b4 = pb2 * rb2
+
+        let a0c = pa0 * ra0
+        let a1c = pa0 * ra1 + pa1 * ra0
+        let a2c = pa0 * ra2 + pa1 * ra1 + pa2 * ra0
+        let a3c = pa1 * ra2 + pa2 * ra1
+        let a4c = pa2 * ra2
+
+        self.b = [b0, b1, b2, b3, b4]
+        self.a = [a0c, a1c, a2c, a3c, a4c]
+    }
+
+    func process(_ x: Double, state: inout KWeightingState) -> Double {
+        let y = (b[0] * x
+                 + b[1] * state.x1
+                 + b[2] * state.x2
+                 + b[3] * state.x3
+                 + b[4] * state.x4
+                 - a[1] * state.y1
+                 - a[2] * state.y2
+                 - a[3] * state.y3
+                 - a[4] * state.y4) / a[0]
+
+        state.x4 = state.x3; state.x3 = state.x2; state.x2 = state.x1; state.x1 = x
+        state.y4 = state.y3; state.y3 = state.y2; state.y2 = state.y1; state.y1 = y
+        return y
+    }
+}
+
+private struct KWeightingState {
+    var x1 = 0.0, x2 = 0.0, x3 = 0.0, x4 = 0.0
+    var y1 = 0.0, y2 = 0.0, y3 = 0.0, y4 = 0.0
+}
+
+// MARK: - Gain
+
+private enum AudioDSP {
+    static func applyGain(in buffer: AVAudioPCMBuffer, gainDB: Double) {
+        guard let data = buffer.floatChannelData else { return }
+        let gain = Float(pow(10.0, gainDB / 20.0))
+        let channels = Int(buffer.format.channelCount)
+        let frames = Int(buffer.frameLength)
 
         for ch in 0..<channels {
-            // Each channel needs its own filter state.
-            var f1 = s1
-            var f2 = s2
-
-            let ptr = chData[ch]
-            for i in 0..<n {
-                let x = ptr[i]
-                let y1 = f1.process(x)
-                let y2 = f2.process(y1)
-                ptr[i] = y2
+            let ptr = data[ch]
+            for i in 0..<frames {
+                ptr[i] *= gain
             }
         }
-
-        return copy
     }
+}
 
-    private func channelWeightsForITU1770(channelCount: Int) -> [Float] {
-        // BS.1770-5 Table 3: L,R,C = 1.0; Ls,Rs = 1.41; LFE excluded.
-        // We apply a pragmatic mapping for common layouts:
-        // 1ch: [L]
-        // 2ch: [L, R]
-        // 5ch: [L, R, C, Ls, Rs]
-        // 6ch: [L, R, C, LFE(0), Ls, Rs]
-        switch channelCount {
-        case 1:
-            return [1.0]
-        case 2:
-            return [1.0, 1.0]
-        case 5:
-            return [1.0, 1.0, 1.0, 1.41, 1.41]
-        case 6:
-            return [1.0, 1.0, 1.0, 0.0, 1.41, 1.41]
-        default:
-            // Fallback: treat all channels equally (not fully standard for multichannel).
-            return Array(repeating: 1.0, count: channelCount)
-        }
-    }
+// MARK: - True Peak metering + limiting
 
-    // MARK: - True Peak (dBTP)
+private enum TruePeakMeter {
 
-    private func measureTruePeakDBTP(measurementSampleRate: Double) throws -> Float {
-        let measured = try convertedToFloat32NonInterleaved(sampleRate: measurementSampleRate)
+    static func truePeakDBTP(of buffer: AVAudioPCMBuffer, oversampleFactor: Int) throws -> Double {
+        let osr = buffer.format.sampleRate * Double(oversampleFactor)
+        let osFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                     sampleRate: osr,
+                                     channels: buffer.format.channelCount,
+                                     interleaved: false)!
+        let osBuffer = try AudioBufferConverter.convert(buffer, to: osFormat)
 
-        guard let chData = measured.floatChannelData else {
-            throw LoudnessNormalizationError.unsupportedFormat
-        }
-
-        let channels = Int(measured.format.channelCount)
-        let n = Int(measured.frameLength)
+        guard let data = osBuffer.floatChannelData else { return -Double.infinity }
+        let channels = Int(osBuffer.format.channelCount)
+        let frames = Int(osBuffer.frameLength)
 
         var maxAbs: Float = 0
         for ch in 0..<channels {
-            var localMax: Float = 0
-            vDSP_maxmgv(chData[ch], 1, &localMax, vDSP_Length(n))
-            maxAbs = max(maxAbs, localMax)
+            let ptr = data[ch]
+            for i in 0..<frames {
+                maxAbs = max(maxAbs, abs(ptr[i]))
+            }
         }
 
-        // Convert to dBTP (full scale == 1.0).
-        return Self.linearToDB(max(maxAbs, 1e-12))
+        guard maxAbs > 0 else { return -Double.infinity }
+        return 20.0 * log10(Double(maxAbs))
     }
+}
 
-    // MARK: - Gain application
+private enum TruePeakLimiter {
 
-    private func applyingLinearGain(_ gain: Float) throws -> AVAudioPCMBuffer {
-        // Work in Float32 for safe scaling, then convert back to original format if needed.
-        let float = try convertedToFloat32NonInterleaved(sampleRate: format.sampleRate)
-        guard let chData = float.floatChannelData else {
-            throw LoudnessNormalizationError.unsupportedFormat
-        }
+    /// Offline, oversampled, peak-linked limiter (single-band).
+    static func limit(buffer: AVAudioPCMBuffer, ceilingDBTP: Double, oversampleFactor: Int) throws -> AVAudioPCMBuffer {
+        let ceiling = Float(pow(10.0, ceilingDBTP / 20.0))
 
-        let channels = Int(float.format.channelCount)
-        let n = Int(float.frameLength)
+        // Upsample
+        let osr = buffer.format.sampleRate * Double(oversampleFactor)
+        let osFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                     sampleRate: osr,
+                                     channels: buffer.format.channelCount,
+                                     interleaved: false)!
+        var osBuffer = try AudioBufferConverter.convert(buffer, to: osFormat)
 
-        for ch in 0..<channels {
-            var g = gain
-            vDSP_vsmul(chData[ch], 1, &g, chData[ch], 1, vDSP_Length(n))
-        }
+        guard let data = osBuffer.floatChannelData else { return buffer }
+        let channels = Int(osBuffer.format.channelCount)
+        let frames = Int(osBuffer.frameLength)
 
-        // If original is already Float32 non-interleaved at the same SR, return directly.
-        if format.commonFormat == .pcmFormatFloat32,
-           format.isInterleaved == false,
-           abs(format.sampleRate - float.format.sampleRate) < 0.5,
-           format.channelCount == float.format.channelCount {
-            return float
-        }
-
-        // Otherwise convert back to the original format.
-        return try float.converted(to: format)
-    }
-
-    // MARK: - Conversions / copying
-
-    private func convertedToFloat32NonInterleaved(sampleRate: Double) throws -> AVAudioPCMBuffer {
-        guard let outFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: sampleRate,
-            channels: format.channelCount,
-            interleaved: false
-        ) else {
-            throw LoudnessNormalizationError.unsupportedFormat
-        }
-        return try converted(to: outFormat)
-    }
-
-    private func copiedBuffer() throws -> AVAudioPCMBuffer {
-        guard let out = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCapacity) else {
-            throw LoudnessNormalizationError.conversionFailed("Failed to allocate copy buffer.")
-        }
-        out.frameLength = frameLength
-
-        if let src = floatChannelData, let dst = out.floatChannelData, format.commonFormat == .pcmFormatFloat32 {
-            let channels = Int(format.channelCount)
-            let n = Int(frameLength)
+        // Peak link across channels
+        var peak = Array(repeating: Float(0), count: frames)
+        for i in 0..<frames {
+            var m: Float = 0
             for ch in 0..<channels {
-                dst[ch].update(from: src[ch], count: n)
+                m = max(m, abs(data[ch][i]))
             }
-            return out
+            peak[i] = m
         }
 
-        // Fallback: convert to same format via AVAudioConverter.
-        return try converted(to: format)
-    }
+        // Forward lookahead window (offline non-causal gain)
+        let lookaheadSeconds = 0.001 // 1 ms
+        let lookahead = max(1, Int((osr * lookaheadSeconds).rounded()))
+        let futureMax = SlidingWindow.maxForward(peak, window: lookahead)
 
-    private func converted(to outFormat: AVAudioFormat) throws -> AVAudioPCMBuffer {
-        guard let converter = AVAudioConverter(from: format, to: outFormat) else {
-            throw LoudnessNormalizationError.conversionFailed("AVAudioConverter init failed.")
-        }
-        converter.sampleRateConverterQuality = .max
-
-        let ratio = outFormat.sampleRate / format.sampleRate
-        let outCapacity = AVAudioFrameCount((Double(frameLength) * ratio).rounded(.up)) + 8
-
-        guard let outBuffer = AVAudioPCMBuffer(pcmFormat: outFormat, frameCapacity: outCapacity) else {
-            throw LoudnessNormalizationError.conversionFailed("Failed to allocate output buffer.")
+        // Desired gain to enforce ceiling
+        var gDesired = Array(repeating: Float(1), count: frames)
+        for i in 0..<frames {
+            let fm = max(futureMax[i], 1e-9)
+            gDesired[i] = min(1.0, ceiling / fm)
         }
 
-        var error: NSError?
-        var inputConsumed = false
+        // Smooth gain (but never exceed desired gain => guarantees ceiling in the oversampled domain)
+        let attack = 0.0005
+        let release = 0.050
+        let attackCoeff = Float(exp(-1.0 / (attack * osr)))
+        let releaseCoeff = Float(exp(-1.0 / (release * osr)))
 
-        while true {
-            let status = converter.convert(to: outBuffer, error: &error, withInputFrom: { _, outStatus in
-                if inputConsumed {
-                    outStatus.pointee = .endOfStream
-                    return nil
-                } else {
-                    inputConsumed = true
-                    outStatus.pointee = .haveData
-                    return self
+        var g: Float = 1.0
+        for i in 0..<frames {
+            let target = gDesired[i]
+            if target < g {
+                g = attackCoeff * g + (1 - attackCoeff) * target
+            } else {
+                g = releaseCoeff * g + (1 - releaseCoeff) * target
+            }
+
+            g = min(g, target) // hard safety clamp
+
+            if g < 1.0 {
+                for ch in 0..<channels {
+                    data[ch][i] *= g
                 }
-            })
-
-            if let error { throw LoudnessNormalizationError.conversionFailed(error.localizedDescription) }
-
-            switch status {
-            case .haveData, .inputRanDry, .endOfStream:
-                // We feed the whole buffer in one shot; output is now in outBuffer.
-                return outBuffer
-            case .error:
-                throw LoudnessNormalizationError.conversionFailed("AVAudioConverter error.")
-            @unknown default:
-                throw LoudnessNormalizationError.conversionFailed("AVAudioConverter unknown status.")
             }
         }
-    }
 
-    // MARK: - DSP helpers
+        // Downsample back
+        let limited = try AudioBufferConverter.convert(osBuffer, to: buffer.format)
 
-    private struct Biquad {
-        let b0: Float
-        let b1: Float
-        let b2: Float
-        let a1: Float
-        let a2: Float
-
-        // Direct Form I/II state
-        private var x1: Float = 0
-        private var x2: Float = 0
-        private var y1: Float = 0
-        private var y2: Float = 0
-
-        init(b0: Double, b1: Double, b2: Double, a1: Double, a2: Double) {
-            self.b0 = Float(b0)
-            self.b1 = Float(b1)
-            self.b2 = Float(b2)
-            self.a1 = Float(a1)
-            self.a2 = Float(a2)
+        // Safety: if resampling introduced a tiny overshoot, run once more.
+        let tp = try TruePeakMeter.truePeakDBTP(of: limited, oversampleFactor: oversampleFactor)
+        if tp > ceilingDBTP {
+            return try limit(buffer: limited, ceilingDBTP: ceilingDBTP, oversampleFactor: oversampleFactor)
         }
 
-        mutating func process(_ x: Float) -> Float {
-            let y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2
-            x2 = x1
-            x1 = x
-            y2 = y1
-            y1 = y
-            return y
+        return limited
+    }
+}
+
+private enum SlidingWindow {
+    /// out[i] = max(x[i...i+window-1]) (window shrinks near the end)
+    static func maxForward(_ x: [Float], window: Int) -> [Float] {
+        let n = x.count
+        guard n > 0 else { return [] }
+
+        let w = max(1, window)
+        var out = Array(repeating: Float(0), count: n)
+
+        var dq: [Int] = []
+        dq.reserveCapacity(min(n, w))
+        var head = 0
+
+        @inline(__always) func push(_ idx: Int) {
+            while dq.count > head, x[idx] >= x[dq[dq.count - 1]] {
+                dq.removeLast()
+            }
+            dq.append(idx)
         }
-    }
 
-    private static func dbToLinear(_ db: Float) -> Float {
-        powf(10.0, db / 20.0)
-    }
+        let initialEnd = min(n, w)
+        for idx in 0..<initialEnd { push(idx) }
+        out[0] = x[dq[head]]
 
-    private static func linearToDB(_ linear: Float) -> Float {
-        20.0 * log10f(linear)
+        if n == 1 { return out }
+
+        for i in 1..<n {
+            while dq.count > head, dq[head] < i { head += 1 }
+
+            let newIdx = i + w - 1
+            if newIdx < n { push(newIdx) }
+
+            if head > 1024 {
+                dq.removeFirst(head)
+                head = 0
+            }
+
+            out[i] = (dq.count > head) ? x[dq[head]] : 0
+        }
+
+        return out
     }
 }
