@@ -134,17 +134,18 @@ actor OverlayPlayerActor {
       let duration = Double(file.length) / file.fileFormat.sampleRate
       audioFile = file
       state = .idle  // Ready to play
-        if configuration.normalized {
-          guard let directBuffer = AVAudioPCMBuffer(
-              pcmFormat: file.processingFormat,
-              frameCapacity: AVAudioFrameCount(file.length)
-          ) else {
-              throw AudioPlayerError.fileLoadFailed(reason: "Cannot create audio buffer for \(url.lastPathComponent)")
-          }
-          try file.read(into: directBuffer)
-          buffer = directBuffer.normalize()
+      guard let directBuffer = AVAudioPCMBuffer(
+          pcmFormat: file.processingFormat,
+          frameCapacity: AVAudioFrameCount(file.length)
+      ) else {
+          throw AudioPlayerError.fileLoadFailed(reason: "Cannot create audio buffer for \(url.lastPathComponent)")
+      }
+      try file.read(into: directBuffer)
+
+      if configuration.normalized {
+        buffer = directBuffer.normalize()
       } else {
-          buffer = nil
+        buffer = directBuffer
       }
       Logger.audio.info("[Overlay] File loaded: \(url.lastPathComponent) (\(String(format: "%.2f", duration))s, \(file.length) frames @ \(Int(file.fileFormat.sampleRate))Hz)")
     } catch {
