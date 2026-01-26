@@ -375,41 +375,26 @@ actor AudioSessionManager {
         }
     }
 
-    /// Force reconfigure audio session with our category and options (internal implementation)
-    /// Used for recovery after external code changes audio session category
+    /// Validate current audio session state without modifying it
     ///
-    /// **Defensive Pattern:**
-    /// When external code (e.g., developer recording) changes audio session category,
-    /// this method forces our `.playback` category back to restore audio playback.
+    /// SDK does not manage AVAudioSession — it only observes and reports.
+    /// Returns validation result that callers can use to warn developers
+    /// or decide whether to proceed with playback.
     ///
-    /// - Throws: AudioPlayerError if reconfiguration fails
-    private func _forceReconfigureInternal() throws {
-        // External mode: do NOT force reconfigure (app manages session)
-        if mode == .external {
-            Self.logger.warning("⚠️ External mode: Cannot force reconfigure (app-managed session)")
-            Self.logger.warning("  Audio session was changed externally")
-            Self.logger.warning("  App developer must restore session configuration")
-            throw AudioPlayerError.sessionConfigurationFailed(
-                reason: "Cannot force reconfigure in external mode. App must manage audio session."
-            )
+    /// - Returns: Validation result indicating session health
+    func validateSessionState() -> SessionValidationResult {
+        if mode == .managed {
+            let current = session.category
+            if current != .playback {
+                Self.logger.warning("⚠️ Session category mismatch: \(current.rawValue) ≠ playback")
+                return .categoryChanged(
+                    current: current.rawValue,
+                    expected: AVAudioSession.Category.playback.rawValue
+                )
+            }
         }
-        
-        guard let options = configuredOptions else {
-            throw AudioPlayerError.sessionConfigurationFailed(
-                reason: "No configured options to restore"
-            )
-        }
-        
-        Self.logger.warning("⚠️ Force reconfiguring audio session (defensive recovery)...")
-        Self.logger.warning("  Restoring: category=.playback, options=\(options.rawValue)")
-        
-        // Use configure with force=true to override current configuration
-        try configure(options: [options], force: true)
-        
-        // Ensure session is active
-        try activate()
-        
-        Self.logger.info("✅ Audio session force reconfigured successfully")
+        // External mode: app manages category, we don't validate it
+        return .valid
     }
 
     /// ⚠️ DEPRECATED - DO NOT USE!
@@ -597,9 +582,8 @@ extension AudioSessionManager: AudioSessionManaging {
         // Following Apple's AVAudioPlayer pattern
     }
     
-    /// Force reconfigure audio session (protocol conformance wrapper)
-    func forceReconfigure() async throws {
-        // Forward to internal implementation
-        try _forceReconfigureInternal()
+    /// Validate session state (protocol conformance wrapper)
+    func validateSession() async -> SessionValidationResult {
+        validateSessionState()
     }
 }
