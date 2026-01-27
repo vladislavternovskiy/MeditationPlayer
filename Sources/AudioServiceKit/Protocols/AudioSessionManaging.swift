@@ -6,13 +6,15 @@
 //
 
 import Foundation
+import AudioServiceCore
 
 /// Protocol for managing AVAudioSession lifecycle
 ///
 /// Abstracts audio session operations to enable dependency injection
 /// and unit testing with mock implementations.
 ///
-/// **Responsibility:** Audio session control only
+/// **Responsibility:** Audio session activation and validation only.
+/// SDK does NOT manage audio session category — it validates and reports.
 protocol AudioSessionManaging: Actor {
     /// Activate audio session
     /// - Throws: AudioPlayerError if activation fails
@@ -25,9 +27,8 @@ protocol AudioSessionManaging: Actor {
     /// Deactivate audio session
     /// - Throws: AudioPlayerError if deactivation fails
     func deactivate() async throws
-    
-    /// Force reconfigure audio session with our category and options
-    /// Used for recovery after external code changes audio session category
-    /// - Throws: AudioPlayerError if reconfiguration fails
-    func forceReconfigure() async throws
+
+    /// Validate current audio session state without modifying it
+    /// - Returns: Validation result indicating session health
+    func validateSession() async -> SessionValidationResult
 }

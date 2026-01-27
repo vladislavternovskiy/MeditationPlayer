@@ -78,9 +78,9 @@ public actor AudioPlayerService: AudioPlayerProtocol {
     /// Skip operation guard to prevent concurrent skip calls
     private var isSkipInProgress: Bool = false
     
-    /// Flag indicating audio session category was changed externally
-    /// When true, next resume()/play() will force reconfigure our category
-    private var categoryWasChangedExternally = false
+    /// Delegate for audio session lifecycle events (category changes, warnings)
+    /// App developer implements this to receive notifications about session state
+    public weak var sessionDelegate: AudioPlayerSessionDelegate?
 
     /// Rate limiting: timestamp of last skip operation (for throttling rapid skips)
     /// Used to prevent UI spam - enforces 0.5s minimum interval between skips
@@ -274,17 +274,12 @@ public actor AudioPlayerService: AudioPlayerProtocol {
 
         self.currentRepeatCount = 0
 
-        // DEFENSIVE RECOVERY: Check if audio session category was changed externally
-        if categoryWasChangedExternally {
-            Self.logger.warning("[SERVICE] Recovering from external category change before starting...")
-            do {
-                try await sessionManager.forceReconfigure()
-                categoryWasChangedExternally = false
-                Self.logger.info("[SERVICE] ✅ Category recovered successfully")
-            } catch {
-                Self.logger.error("[SERVICE] ❌ Failed to recover category: \(error.localizedDescription)")
-                // Continue anyway - try to play with current category
-            }
+        // Validate session state — warn if category changed, don't try to fix
+        let validation = await sessionManager.validateSession()
+        if case .categoryChanged(let current, let expected) = validation {
+            Self.logger.warning("[SERVICE] ⚠️ Session category mismatch: \(current) ≠ \(expected)")
+            Self.logger.warning("[SERVICE] Playback may not work. App must restore session category.")
+            await sessionDelegate?.audioPlayerSessionCategoryDidChange(validation: validation)
         }
 
         // Activate audio session
@@ -401,17 +396,12 @@ public actor AudioPlayerService: AudioPlayerProtocol {
     private func _resumeImpl() async throws {
         Self.logger.debug("→ _resumeImpl()")
 
-        // DEFENSIVE RECOVERY: Check if audio session category was changed externally
-        if categoryWasChangedExternally {
-            Self.logger.warning("[SERVICE] Recovering from external category change...")
-            do {
-                try await sessionManager.forceReconfigure()
-                categoryWasChangedExternally = false
-                Self.logger.info("[SERVICE] ✅ Category recovered successfully")
-            } catch {
-                Self.logger.error("[SERVICE] ❌ Failed to recover category: \(error.localizedDescription)")
-                // Continue anyway - try to resume with current category
-            }
+        // Validate session state — warn if category changed, don't try to fix
+        let validation = await sessionManager.validateSession()
+        if case .categoryChanged(let current, let expected) = validation {
+            Self.logger.warning("[SERVICE] ⚠️ Session category mismatch: \(current) ≠ \(expected)")
+            Self.logger.warning("[SERVICE] Playback may not work. App must restore session category.")
+            await sessionDelegate?.audioPlayerSessionCategoryDidChange(validation: validation)
         }
 
         Self.logger.debug("[SERVICE] resume()")
@@ -1745,17 +1735,22 @@ public actor AudioPlayerService: AudioPlayerProtocol {
         Self.logger.info("[INTERRUPTION] Handler called - shouldResume: \(shouldResume), currentState: \(currentState)")
         
         if shouldResume {
-            // Reactivate audio session after interruption (critical for phone calls)
-            // iOS deactivates session during interruption - must reactivate before resume
-            do {
-                try await sessionManager.activate()
-                Self.logger.debug("[INTERRUPTION] Audio session reactivated")
-            } catch {
-                Self.logger.error("[INTERRUPTION] Failed to reactivate session: \(error.localizedDescription)")
+            // Validate session before resume
+            let validation = await sessionManager.validateSession()
+            if case .categoryChanged = validation {
+                Self.logger.warning("[INTERRUPTION] Category changed during interruption")
+                await sessionDelegate?.audioPlayerSessionCategoryDidChange(validation: validation)
+                // Don't resume — category is wrong, delegate was notified
+                // Ensure player is in paused state so user can manually resume later
+                // Re-fetch state after suspension points (delegate call may have changed it)
+                let latestState = await playbackStateCoordinator.getPlaybackMode()
+                if latestState != .paused {
+                    await pauseAll()
+                }
                 return
             }
 
-            // Try to resume playback
+            // Resume playback (resume() handles engine.start + node play internally)
             do {
                 try await resume()
                 Self.logger.info("[INTERRUPTION] ✅ Playback resumed successfully")
@@ -1763,12 +1758,10 @@ public actor AudioPlayerService: AudioPlayerProtocol {
                 Self.logger.error("[INTERRUPTION] ❌ Failed to resume: \(error)")
             }
         } else {
-            // Pause playback (interruption began OR ended without resume option)
-            do {
-                try await pause()
-                Self.logger.info("[INTERRUPTION] Playback paused")
-            } catch {
-                Self.logger.warning("[INTERRUPTION] Pause skipped (likely already paused): \(error)")
+            // Pause all components (nodes A/B + overlay + sfx)
+            if currentState == .playing || currentState == .preparing {
+                await pauseAll()
+                Self.logger.info("[INTERRUPTION] All playback paused")
             }
         }
     }
@@ -1787,28 +1780,34 @@ public actor AudioPlayerService: AudioPlayerProtocol {
             routeChangeDebounceTask?.cancel()
             routeChangeDebounceTask = nil
 
-            try? await pause()
+            await pauseAll()
 
         case .categoryChange:
-            // DEFENSIVE: External code changed audio session category (e.g., developer recording)
-            // Pause gracefully and mark for recovery on next resume()/play()
-            // This follows industry best practice (Spotify, Apple Music pattern)
-            Self.logger.warning("[ROUTE_CHANGE] Category changed externally - pausing defensively")
+            // External code changed audio session category (e.g., developer recording)
+            // SDK does NOT manage session — validate, warn, and pause nodes
+            Self.logger.info("[ROUTE_CHANGE] Category change event received")
             
             // Cancel any pending route change tasks
             routeChangeDebounceTask?.cancel()
             routeChangeDebounceTask = nil
             
-            // Mark for recovery
-            categoryWasChangedExternally = true
-            
-            // Pause gracefully (only if currently playing)
-            let currentState = await state
-            if currentState == .playing {
-                Self.logger.warning("[ROUTE_CHANGE] Pausing playback due to external category change")
-                try? await pause()
+            // Validate session state (read-only, no side effects)
+            let validation = await sessionManager.validateSession()
+            if case .categoryChanged(let current, let expected) = validation {
+                Self.logger.warning("[ROUTE_CHANGE] Category mismatch: \(current) ≠ \(expected)")
+                Self.logger.warning("[ROUTE_CHANGE] App developer must restore audio session category")
+                
+                // Pause only when validation confirms category is wrong
+                let currentState = await playbackStateCoordinator.getPlaybackMode()
+                if currentState == .playing || currentState == .preparing {
+                    await pauseAll()
+                    Self.logger.warning("[ROUTE_CHANGE] All playback paused due to category mismatch")
+                }
+                
+                // Notify delegate so app can restore session
+                await sessionDelegate?.audioPlayerSessionCategoryDidChange(validation: validation)
             } else {
-                Self.logger.info("[ROUTE_CHANGE] Not playing, skipping pause")
+                Self.logger.debug("[ROUTE_CHANGE] Category change event but session is valid — no action")            
             }
 
         case .newDeviceAvailable, .override:
@@ -2503,7 +2502,8 @@ public actor AudioPlayerService: AudioPlayerProtocol {
         }
 
         // Guard: only pause if playing or preparing
-        let currentState = await state
+        // Use coordinator (source of truth) — _cachedState may lag after updateState() suspension
+        let currentState = await playbackStateCoordinator.getPlaybackMode()
         guard currentState == .playing || currentState == .preparing else {
             // If already paused or finished, just pause overlay and return
             if currentState == .paused || currentState == .finished {
