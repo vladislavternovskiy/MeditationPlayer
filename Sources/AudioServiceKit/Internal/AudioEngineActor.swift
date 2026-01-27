@@ -257,7 +257,7 @@ actor AudioEngineActor {
         }
         // AVFoundation quirk: isPlaying may be unreliable after pause()
         // Strategy: If player is not playing AND we have an offset, it's a resume
-        let needsReschedule = !player.isPlaying //&& offset > 0
+        let needsReschedule = true//!player.isPlaying && offset > 0
 
         if needsReschedule {
             // Resume from saved position
