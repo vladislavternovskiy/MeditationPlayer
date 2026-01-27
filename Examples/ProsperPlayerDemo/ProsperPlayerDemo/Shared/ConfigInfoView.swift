@@ -104,10 +104,10 @@ struct ConfigInfoView: View {
     private var advancedSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             sectionHeader("Advanced", icon: "wrench.and.screwdriver")
-            
+
             configRow(
                 label: "Audio Session",
-                value: formatAudioSessionOptions(config.audioSessionOptions),
+                value: "App-managed",
                 icon: "waveform.circle"
             )
         }
@@ -206,44 +206,10 @@ struct ConfigInfoView: View {
         return "\(percentage)%"
     }
     
-    private func formatAudioSessionOptions(_ options: AudioSessionOptions) -> String {
-        #if canImport(UIKit)
-        if options == PlayerConfiguration.defaultAudioSessionOptions {
-            return "Default (mix with others)"
-        }
-        
-        var parts: [String] = []
-        if options.contains(.mixWithOthers) {
-            parts.append("Mix")
-        }
-        if options.contains(.duckOthers) {
-            parts.append("Duck")
-        }
-        if options.contains(.allowBluetoothA2DP) {
-            parts.append("Bluetooth")
-        }
-        if options.contains(.allowAirPlay) {
-            parts.append("AirPlay")
-        }
-        if options.contains(.defaultToSpeaker) {
-            parts.append("Speaker")
-        }
-        
-        return parts.isEmpty ? "None" : parts.joined(separator: ", ")
-        #else
-        return "N/A (macOS)"
-        #endif
-    }
-    
     // MARK: - Computed Properties
-    
+
     private var showAdvanced: Bool {
-        // Show advanced section if using non-default options
-        #if canImport(UIKit)
-        return config.audioSessionOptions != PlayerConfiguration.defaultAudioSessionOptions
-        #else
-        return false
-        #endif
+        false // Audio session is always app-managed now
     }
 }
 

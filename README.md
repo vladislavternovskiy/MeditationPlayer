@@ -472,64 +472,46 @@ ProsperPlayer includes production-grade audio stability optimizations:
 ## 🧪 Testing
 ## 🎚️ Audio Session Management
 
-ProsperPlayer offers two modes for managing `AVAudioSession`:
+App developer configures `AVAudioSession` **before** creating the player.
+SDK validates session state, warns about incompatibilities, and recovers its own `AVAudioEngine`.
 
-### Managed Mode (Default) ✅
-
-SDK automatically configures and manages the audio session:
-
-```swift
-// Simple - SDK handles everything
-let service = try await AudioPlayerService()
-
-// SDK automatically:
-// - Sets category: .playback
-// - Enables Bluetooth: .allowBluetoothA2DP
-// - Activates session
-// - Recovers from interruptions
-```
-
-**When to use:**
-- ✅ Most apps (95% of use cases)
-- ✅ Simple integration
-- ✅ Self-healing from external changes
-- ✅ Production-tested configuration
-
----
-
-### External Mode (Advanced) ⚙️
-
-App developer manually configures audio session **before** creating player:
+### Setup (Required)
 
 ```swift
-// 1. Configure audio session FIRST
+// 1. Configure audio session (app responsibility)
 let session = AVAudioSession.sharedInstance()
-
-// Option 1: Simple playback (recommended)
-try session.setCategory(
-    .playback,
-    options: [
-        .allowBluetoothA2DP   // High-quality Bluetooth
-    ]
-)
+try session.setCategory(.playback)
 try session.setActive(true)
 
-// 2. THEN create player with external mode
-let config = PlayerConfiguration(audioSessionMode: .external)
-let service = try await AudioPlayerService(configuration: config)
+// 2. Create player — SDK validates session at init
+let service = try await AudioPlayerService()
 ```
 
-**When to use:**
-- ⚙️ Need custom audio session configuration
-- ⚙️ App has multiple audio components
-- ⚙️ Recording + playback (`.playAndRecord` category)
-- ⚙️ Custom audio routing requirements
+**SDK behavior:**
+- ✅ Validates session category is compatible (`.playback`, `.playAndRecord`, `.multiRoute`)
+- ✅ Warns in console if Bluetooth or speaker routing is suboptimal
+- ✅ Recovers AVAudioEngine if iOS stops it due to interruption or category change
+- ❌ Does NOT set category or options — that's your responsibility
 
-**⚠️ Important:** SDK validates your configuration and shows errors if incompatible!
+### Session Delegate
 
----
+Register a delegate to receive notifications when session state changes:
 
-### External Mode with Recording
+```swift
+class MyHandler: AudioPlayerSessionDelegate {
+    func audioPlayerSessionCategoryDidChange(
+        validation: SessionValidationResult
+    ) async {
+        // Restore session and resume if needed
+        try? AVAudioSession.sharedInstance().setCategory(.playback)
+        try? await player.resume()
+    }
+}
+
+player.sessionDelegate = handler
+```
+
+### Recording + Playback
 
 If you need recording capability, use `.playAndRecord` with **`.defaultToSpeaker`**:
 

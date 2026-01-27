@@ -35,6 +35,12 @@ actor AudioEngineActor {
     // Playback state
     private var isEngineRunning = false
 
+    /// Check if underlying AVAudioEngine is actually running
+    /// Use to verify engine state externally (iOS can stop engine silently)
+    var isActuallyRunning: Bool {
+        engine.isRunning
+    }
+
     // Playback offset tracking for accurate seeking
     private var playbackOffsetA: AVAudioFramePosition = 0
     private var playbackOffsetB: AVAudioFramePosition = 0

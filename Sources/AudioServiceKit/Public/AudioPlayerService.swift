@@ -157,13 +157,15 @@ public actor AudioPlayerService: AudioPlayerProtocol {
         guard !isSetupComplete else { return }
         isSetupComplete = true
 
+        // Validate session (app must have configured it before creating player)
+        try await sessionManager.validateAtStartup()
+
+        // Ensure session is active for engine
         do {
-            try await sessionManager.configure(options: configuration.audioSessionOptions, mode: configuration.audioSessionMode)
-            try await sessionManager.activate()
-            Self.logger.debug("Audio session activated in setup()")
+            try await sessionManager.ensureSessionActive()
+            Self.logger.debug("Audio session active in setup()")
         } catch {
             Self.logger.error("Failed to activate audio session in setup(): \(error)")
-
         }
 
         try await audioEngine.setup()
@@ -282,10 +284,10 @@ public actor AudioPlayerService: AudioPlayerProtocol {
             await sessionDelegate?.audioPlayerSessionCategoryDidChange(validation: validation)
         }
 
-        // Activate audio session
+        // Ensure audio session is active for engine
         do {
-            try await sessionManager.activate()
-            Self.logger.debug("[SERVICE] Audio session activated")
+            try await sessionManager.ensureSessionActive()
+            Self.logger.debug("[SERVICE] Audio session active")
         } catch {
             Self.logger.error("[SERVICE] Failed to activate session: \(error)")
             throw AudioPlayerError.sessionConfigurationFailed(
@@ -409,11 +411,14 @@ public actor AudioPlayerService: AudioPlayerProtocol {
 
         if resumedCrossfade {
             Self.logger.debug("[SERVICE] Crossfade resumed, ensuring playback")
-            
+
             // Ensure active player is playing after crossfade resume
             await audioEngine.play()
             Self.logger.debug("[SERVICE] Active player playing after crossfade resume")
-            
+
+            // Resume overlay (voiceover) — pauseAll() pauses it, resume() must restore it
+            await audioEngine.resumeOverlay()
+
             await syncCachedState()
             await syncCachedTrackInfo()
         }
@@ -436,23 +441,46 @@ public actor AudioPlayerService: AudioPlayerProtocol {
                 )
             }
 
+            // CRITICAL: Restart engine after interruption or session change
+            // iOS stops AVAudioEngine during phone calls/Siri/category changes
             do {
-                try await sessionManager.ensureActive()
+                try await sessionManager.ensureSessionActive()
                 Self.logger.debug("[SERVICE] Session ensured active")
-                
-                // CRITICAL: Restart engine after interruption
-                // iOS stops AVAudioEngine during phone calls/Siri
                 try await audioEngine.start()
                 Self.logger.debug("[SERVICE] Engine restarted")
             } catch {
-                Self.logger.error("[SERVICE] Failed to ensure session/engine active: \(error)")
-                throw AudioPlayerError.sessionConfigurationFailed(
-                    reason: "Failed to ensure active: \(error.localizedDescription)"
-                )
+                // Engine recovery: iOS may have stopped engine due to session changes
+                Self.logger.warning("[SERVICE] Engine start failed, attempting recovery...")
+
+                let validation = await sessionManager.validateSession()
+                if case .categoryChanged = validation {
+                    Self.logger.error("[SERVICE] Cannot recover: session category incompatible")
+                    await sessionDelegate?.audioPlayerSessionCategoryDidChange(validation: validation)
+                    throw AudioPlayerError.engineStartFailed(
+                        reason: "Session category incompatible — app must restore category before resume"
+                    )
+                }
+
+                // Emergency recovery: setActive + prepare + start
+                do {
+                    try await sessionManager.ensureSessionActive()
+                    try await audioEngine.prepare()
+                    try await audioEngine.start()
+                    Self.logger.info("[SERVICE] Engine recovered successfully")
+                } catch {
+                    Self.logger.error("[SERVICE] Engine recovery failed: \(error)")
+                    throw AudioPlayerError.engineStartFailed(
+                        reason: "Engine recovery failed: \(error.localizedDescription)"
+                    )
+                }
             }
 
             await audioEngine.play()
             Self.logger.debug("[SERVICE] Engine resumed")
+
+            // Resume overlay (voiceover) — pauseAll() pauses it, resume() must restore it
+            await audioEngine.resumeOverlay()
+
             await crossfadeOrchestrator.performSimpleFadeIn(duration: 0.3)
 
             Self.logger.info("[SERVICE] Normal resume completed")
@@ -672,8 +700,7 @@ public actor AudioPlayerService: AudioPlayerProtocol {
             fadeCurve: configuration.fadeCurve,
             repeatMode: configuration.repeatMode,
             repeatCount: configuration.repeatCount,
-            volume: clampedVolume,
-            audioSessionOptions: configuration.audioSessionOptions
+            volume: clampedVolume
         )
     }
 
@@ -700,8 +727,7 @@ public actor AudioPlayerService: AudioPlayerProtocol {
             fadeCurve: configuration.fadeCurve,
             repeatMode: mode,
             repeatCount: configuration.repeatCount,
-            volume: configuration.volume,
-            audioSessionOptions: configuration.audioSessionOptions
+            volume: configuration.volume
         )
 
         // Sync to PlaylistManager
@@ -759,56 +785,9 @@ public actor AudioPlayerService: AudioPlayerProtocol {
         Self.logger.info("Configuration updated: crossfade=\(config.crossfadeDuration)s, repeatMode=\(config.repeatMode)")
     }
 
-    // MARK: - Dynamic Audio Session Options (Testing)
-
-    #if DEBUG
-    /// Update audio session options dynamically (DEBUG ONLY - for testing)
-    ///
-    /// **WARNING:** This is an experimental API for testing lock screen controls behavior!
-    ///
-    /// **What it does:**
-    /// - Dynamically changes AVAudioSession category options while session is active
-    /// - May cause audio route changes (brief interruption)
-    /// - **CRITICAL:** Lock screen controls may disappear if you add `.mixWithOthers`!
-    ///
-    /// **Testing Scenario:**
-    /// 1. Start with `[]` (empty options) → lock screen controls appear ✅
-    /// 2. Call this method with `[.mixWithOthers]` → test if controls disappear ❓
-    /// 3. Call this method with `[]` again → test if controls come back ❓
-    ///
-    /// **Example:**
-    /// ```swift
-    /// // Start playback with empty options (lock screen controls work)
-    /// try await service.startPlaying()
-    ///
-    /// // Test: Add .mixWithOthers - do controls disappear?
-    /// try await service.updateAudioSessionOptions([.mixWithOthers])
-    ///
-    /// // Test: Remove options - do controls come back?
-    /// try await service.updateAudioSessionOptions([])
-    /// ```
-    ///
-    /// - Parameter options: New audio session options
-    /// - Throws: AudioPlayerError if update fails
-    public func updateAudioSessionOptions(_ options: [AVAudioSession.CategoryOptions]) async throws {
-        try await AudioSessionManager.shared.updateCategoryOptions(options)
-        
-        // Update internal configuration to match
-        var newConfig = configuration
-        // Note: PlayerConfiguration.audioSessionOptions is let, so we create new config
-        newConfig = PlayerConfiguration(
-            crossfadeDuration: configuration.crossfadeDuration,
-            fadeCurve: configuration.fadeCurve,
-            repeatMode: configuration.repeatMode,
-            repeatCount: configuration.repeatCount,
-            volume: configuration.volume,
-            audioSessionOptions: options
-        )
-        self.configuration = newConfig
-        
-        Self.logger.warning("⚠️ Audio session options updated dynamically (testing mode)")
-    }
-    #endif
+    // MARK: - Audio Session (removed in v4.5)
+    // SDK no longer manages audio session options.
+    // App developer configures AVAudioSession before creating player.
 
     #if DEBUG
     /// Reset player to initial state with default configuration (DEBUG only)
@@ -1720,10 +1699,10 @@ public actor AudioPlayerService: AudioPlayerProtocol {
     // MARK: - Session Event Handlers
 
     /// Ensure audio session is active before critical operations
-    /// Protects against external AVAudioPlayer interference
+    /// SDK needs session active for AVAudioEngine operation
     private func ensureSessionActive() async throws {
         do {
-            try await sessionManager.activate()
+            try await sessionManager.ensureSessionActive()
         } catch {
             Self.logger.error("[SESSION] Failed to ensure session active: \(error.localizedDescription)")
             throw error
@@ -1841,8 +1820,8 @@ public actor AudioPlayerService: AudioPlayerProtocol {
                 Self.logger.debug("[ROUTE_CHANGE] Debounce complete - reactivating session")
 
                 do {
-                    try await sessionManager.activate()
-                    Self.logger.info("[ROUTE_CHANGE] Session reactivated successfully on route: \(await sessionManager.getCurrentRoute())")
+                    try await sessionManager.ensureSessionActive()
+                    Self.logger.info("[ROUTE_CHANGE] Session ensured active on route: \(await sessionManager.getCurrentRoute())")
                     // Audio continues automatically if playing
                 } catch {
                     Self.logger.error("[ROUTE_CHANGE] Failed to reactivate session: \(error.localizedDescription)")
@@ -1864,23 +1843,17 @@ public actor AudioPlayerService: AudioPlayerProtocol {
             Self.logger.debug("[MEDIA_SERVICES] Saved playback position: \(pos)s")
         }
 
-        // Step 2: Reconfigure audio session from scratch with user's options
-        do {
-            try await sessionManager.configure(options: configuration.audioSessionOptions, mode: configuration.audioSessionMode, force: true)
-            Self.logger.debug("[MEDIA_SERVICES] Session reconfigured successfully (force)")
-        } catch {
-            Self.logger.error("[MEDIA_SERVICES] Failed to reconfigure session: \(error.localizedDescription)")
-            // Enter failed state if we can't recover
-            await updateState(.failed(.sessionConfigurationFailed(
-                reason: "Media services reset - reconfiguration failed: \(error.localizedDescription)"
-            )))
-            return
+        // Step 2: Validate session state (app manages category, SDK only checks)
+        let validation = await sessionManager.validateSession()
+        if case .categoryChanged = validation {
+            Self.logger.error("[MEDIA_SERVICES] Session category incompatible after reset")
+            await sessionDelegate?.audioPlayerSessionCategoryDidChange(validation: validation)
         }
 
-        // Step 3: Reactivate session
+        // Step 3: Reactivate session for engine recovery
         do {
-            try await sessionManager.activate()
-            Self.logger.debug("[MEDIA_SERVICES] Session reactivated successfully")
+            try await sessionManager.ensureSessionActive()
+            Self.logger.debug("[MEDIA_SERVICES] Session reactivated for engine recovery")
         } catch {
             Self.logger.error("[MEDIA_SERVICES] Failed to reactivate session: \(error.localizedDescription)")
             await updateState(.failed(.sessionConfigurationFailed(

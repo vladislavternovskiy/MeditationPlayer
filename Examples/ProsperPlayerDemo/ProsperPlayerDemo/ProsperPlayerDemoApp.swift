@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import AVFoundation
 import AudioServiceKit
 import AudioServiceCore
 
@@ -42,6 +43,16 @@ struct ProsperPlayerDemoApp: App {
                 }
             }
             .task {
+                // Configure audio session (app responsibility)
+                // SDK validates but does NOT set category
+                do {
+                    let session = AVAudioSession.sharedInstance()
+                    try session.setCategory(.playback)
+                    try session.setActive(true)
+                } catch {
+                    print("❌ Failed to configure audio session: \(error)")
+                }
+
                 // Initialize audio service at App level
                 // This ensures remote commands are set up early in app lifecycle
                 do {

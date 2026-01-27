@@ -264,8 +264,7 @@ struct ConfigEditorView: View {
             fadeCurve: fadeCurve,
             repeatMode: repeatMode,
             repeatCount: parsedRepeatCount,
-            volume: Float(volume),
-            audioSessionOptions: config.audioSessionOptions // Preserve advanced settings
+            volume: Float(volume)
         )
         
         // Validate

@@ -1,16 +1,4 @@
 import Foundation
-import AVFoundation
-
-// MARK: - Platform-specific type aliases
-
-#if canImport(UIKit)
-public typealias AudioSessionOptions = [AVAudioSession.CategoryOptions]
-#else
-// macOS stub - SDK is iOS-only, this is just for compilation compatibility
-public struct AudioSessionOptions: Sendable, Equatable, ExpressibleByArrayLiteral {
-    public init(arrayLiteral elements: Never...) {}
-}
-#endif
 
 /// Repeat mode for playback
 public enum RepeatMode: Sendable, Equatable {
@@ -26,46 +14,21 @@ public enum RepeatMode: Sendable, Equatable {
 
 /// Simplified player configuration with automatic fade calculations
 /// Replaces AudioConfiguration with more intuitive API
+///
+/// **Audio Session:** App must configure `AVAudioSession` before creating player.
+/// SDK validates session state at init and recovers engine if needed.
+///
+/// ```swift
+/// // 1. App configures session (required)
+/// let session = AVAudioSession.sharedInstance()
+/// try session.setCategory(.playback)
+/// try session.setActive(true)
+///
+/// // 2. Create player
+/// let config = PlayerConfiguration(crossfadeDuration: 5.0)
+/// let player = try await AudioPlayerService(configuration: config)
+/// ```
 public struct PlayerConfiguration: Sendable {
-
-    // MARK: - Audio Session Presets
-
-    /// Default audio session options for peaceful coexistence with other audio apps
-    /// 
-    /// **Configuration:**
-    /// - `.mixWithOthers`: Play alongside other apps (no audio session war)
-    /// - `.allowBluetoothA2DP`: High-quality Bluetooth audio (output + input)
-    /// - `.allowAirPlay`: AirPlay streaming support
-    /// 
-    /// This preset ensures the SDK:
-    /// - Coexists peacefully with other audio apps
-    /// - Supports Bluetooth headsets (audio + microphone)
-    /// - Supports AirPlay streaming
-    /// - Works with `.playAndRecord` category (for microphone access)
-    /// 
-    /// **Note:** The following options are NOT included:
-    /// - `.duckOthers`: Requires special modes (.voiceChat, .videoChat, .spokenAudio)
-    ///   Using this with `.default` mode causes **error -50** on real devices.
-    /// 
-    /// **Category:** These options are compatible with `.playAndRecord` category,
-    /// which allows both audio playback AND microphone recording.
-    /// 
-    /// **Warning:** Only override if you understand iOS audio session behavior!
-    /// Custom options may cause conflicts with other audio sources.
-    #if canImport(UIKit)
-    // CRITICAL FIX: Empty options required for lock screen controls to appear!
-    // Source: Stack Overflow - "Passing ANY argument for AVAudioSessionCategoryPlaybackOptions
-    // causes the lock screen controls to not display"
-    // https://stackoverflow.com/questions/34688128/
-    public static let defaultAudioSessionOptions: AudioSessionOptions = []
-
-    // Previously used options (BLOCKED lock screen controls):
-    // .mixWithOthers - Prevents lock screen from showing controls
-    // .allowBluetoothA2DP - May interfere with .playback category
-    // .allowAirPlay - May interfere with .playback category
-    #else
-    public static let defaultAudioSessionOptions: AudioSessionOptions = []
-    #endif
 
     // MARK: - Crossfade Settings
 
@@ -96,57 +59,11 @@ public struct PlayerConfiguration: Sendable {
     /// - N: Loop N times then stop
     public let repeatCount: Int?
 
-    // DELETED (v4.0): singleTrackFadeInDuration and singleTrackFadeOutDuration
-    // Now using crossfadeDuration for all track transitions
-
     // MARK: - Audio Settings
 
     /// Volume level (0.0 = silent, 1.0 = maximum)
     /// Standard AVFoundation audio range
     public let volume: Float
-
-    // MARK: - Stop Settings
-
-    // DELETED (v4.0): stopFadeDuration
-    // Now always passed as method parameter in stop(fadeDuration:)
-
-    // MARK: - Audio Session Settings
-
-    // MARK: - Audio Session Mode
-
-    /// Audio session management mode
-    /// 
-    /// **Default:** `.managed` (SDK manages session)
-    /// - `.managed`: SDK configures and activates session (recommended)
-    /// - `.external`: App developer manages session (advanced)
-    /// 
-    /// **See:** `AudioSessionMode` for detailed behavior
-    public let audioSessionMode: AudioSessionMode
-
-    /// Audio session category options
-    /// 
-    /// **Default:** `PlayerConfiguration.defaultAudioSessionOptions`
-    /// - Peaceful coexistence with other audio apps
-    /// - High-quality Bluetooth and AirPlay support
-    /// 
-    /// **Custom Options:**
-    /// Only override if you have specific audio session requirements.
-    /// 
-    /// **Warning:** Custom options trigger a console warning to ensure intentional use.
-    /// 
-    /// **Example:**
-    /// ```swift
-    /// // Use defaults (recommended)
-    /// let config = PlayerConfiguration()
-    /// 
-    /// // Custom options (advanced)
-    /// let customConfig = PlayerConfiguration(
-    ///     audioSessionOptions: [.mixWithOthers, .duckOthers]
-    /// )
-    /// ```
-    public let audioSessionOptions: AudioSessionOptions
-
-    // MARK: - Computed Properties
 
     // MARK: - Initialization
 
@@ -155,35 +72,13 @@ public struct PlayerConfiguration: Sendable {
         fadeCurve: FadeCurve = .equalPower,
         repeatMode: RepeatMode = .off,
         repeatCount: Int? = nil,
-        volume: Float = 1.0,
-        audioSessionOptions: AudioSessionOptions = PlayerConfiguration.defaultAudioSessionOptions,
-        audioSessionMode: AudioSessionMode = .managed
+        volume: Float = 1.0
     ) {
         self.crossfadeDuration = max(0.0, min(30.0, crossfadeDuration))
         self.fadeCurve = fadeCurve
         self.repeatMode = repeatMode
         self.repeatCount = repeatCount
         self.volume = max(0.0, min(1.0, volume))
-        self.audioSessionOptions = audioSessionOptions
-        self.audioSessionMode = audioSessionMode
-
-        // Warning: User is overriding default audio session options
-        if audioSessionOptions != PlayerConfiguration.defaultAudioSessionOptions {
-            print("")
-            print("WARNING: Custom audio session options detected!")
-            print("  You are using custom AVAudioSession.CategoryOptions instead of defaults.")
-            print("  Default options: \(PlayerConfiguration.defaultAudioSessionOptions)")
-            print("  Your options:    \(audioSessionOptions)")
-            print("  ")
-            print("  This may cause conflicts with:")
-            print("    - Other audio apps (AVAudioPlayer, music apps)")
-            print("    - System audio (alerts, notifications)")
-            print("    - Bluetooth/AirPlay devices")
-            print("  ")
-            print("  Only use custom options if you understand iOS audio session behavior!")
-            print("  Recommended: Use PlayerConfiguration.defaultAudioSessionOptions")
-            print("")
-        }
     }
 
     // MARK: - Default Configuration
@@ -210,8 +105,6 @@ public struct PlayerConfiguration: Sendable {
         if let count = repeatCount, count < 0 {
             throw ConfigurationError.invalidRepeatCount(count)
         }
-
-        // DELETED (v4.0): stopFadeDuration, singleTrackFadeInDuration, singleTrackFadeOutDuration validations
     }
 }
 
@@ -221,7 +114,6 @@ public enum ConfigurationError: Error, LocalizedError {
     case invalidCrossfadeDuration(TimeInterval)
     case invalidVolume(Float)
     case invalidRepeatCount(Int)
-    // DELETED (v4.0): invalidStopFadeDuration, invalidSingleTrackFadeInDuration, invalidSingleTrackFadeOutDuration
 
     public var errorDescription: String? {
         switch self {
