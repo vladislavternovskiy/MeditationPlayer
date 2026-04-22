@@ -350,8 +350,8 @@ final class RemoteCommandManager {
         
         guard var info = nowPlayingCenter.nowPlayingInfo else { return }
         
-//        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = elapsedTime
-//        info[MPNowPlayingInfoPropertyPlaybackRate] = playbackRate
+        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = elapsedTime
+        info[MPNowPlayingInfoPropertyPlaybackRate] = playbackRate
         
         nowPlayingCenter.nowPlayingInfo = info
     }
