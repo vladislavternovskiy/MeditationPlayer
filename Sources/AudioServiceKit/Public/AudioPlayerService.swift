@@ -26,8 +26,24 @@ public actor AudioPlayerService: AudioPlayerProtocol {
     }
 
     /// Syncs cached state from coordinator
+    ///
+    /// Deduplicates redundant emissions: if the coordinator's current state
+    /// matches what we already cached, we skip the `stateSubject.send(...)`.
+    /// `AsyncCurrentValueSubject.send` does not deduplicate, so without this
+    /// guard any place that calls `syncCachedState()` without first changing
+    /// the coordinator (notably `_resumeImpl`'s `resumedCrossfade` branch,
+    /// which refreshes caches before the final `updateState(.playing)`) would
+    /// re-emit the stale value to every subscriber. Downstream consumers
+    /// driving the system Now Playing widget treat that as a real transition
+    /// and briefly show the wrong play/pause icon before the real `.playing`
+    /// arrives.
     private func syncCachedState() async {
-        _cachedState = await playbackStateCoordinator.getPlaybackMode()
+        let newState = await playbackStateCoordinator.getPlaybackMode()
+        guard newState != _cachedState else {
+            Self.logger.debug("[SYNC_STATE] Skipping redundant send: state unchanged at \(newState)")
+            return
+        }
+        _cachedState = newState
         Self.logger.debug("[SYNC_STATE] Sending state: \(_cachedState) to AsyncCurrentValueSubject")
         stateSubject.send(_cachedState)
         Self.logger.debug("[SYNC_STATE] State sent successfully")
