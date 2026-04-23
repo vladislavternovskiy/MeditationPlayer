@@ -413,13 +413,12 @@ struct ExternalModeDemo: View {
     
     private func createPlayer() async {
         validationLogs.append("")
-        validationLogs.append("Creating player with external mode...")
-        
+        validationLogs.append("Creating player (session managed by app)...")
+
         do {
             let config = PlayerConfiguration(
                 crossfadeDuration: 0.0,
-                volume: 0.8,
-                audioSessionMode: .external  // ← External mode!
+                volume: 0.8
             )
             
             audioService = try await AudioPlayerService(configuration: config)

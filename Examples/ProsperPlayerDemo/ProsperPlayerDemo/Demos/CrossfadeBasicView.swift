@@ -450,28 +450,12 @@ struct CrossfadeBasicView: View {
 
     #if DEBUG
     private func toggleMixWithOthers() async {
-        guard let service = audioService else { return }
-
-        testMessage = nil
-
-        do {
-            let newOptions: [AVAudioSession.CategoryOptions] = hasMixWithOthers ? [] : [.mixWithOthers]
-            
-            testMessage = "Updating options to \(hasMixWithOthers ? "[]" : "[.mixWithOthers]")..."
-            
-            try await service.updateAudioSessionOptions(newOptions)
-            
-            hasMixWithOthers.toggle()
-            
-            testMessage = "✅ Options updated! Check lock screen now."
-            
-            // Clear message after 3 seconds
-            Task {
-                try? await Task.sleep(for: .seconds(3))
-                testMessage = nil
-            }
-        } catch {
-            testMessage = "❌ Failed: \(error.localizedDescription)"
+        // Audio session options are now app-managed
+        // Use AVAudioSession.sharedInstance().setCategory() directly
+        testMessage = "⚠️ Session options are now app-managed. Use AVAudioSession directly."
+        Task {
+            try? await Task.sleep(for: .seconds(3))
+            testMessage = nil
         }
     }
 

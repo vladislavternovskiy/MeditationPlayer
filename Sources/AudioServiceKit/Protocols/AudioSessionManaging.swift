@@ -2,33 +2,29 @@
 //  AudioSessionManaging.swift
 //  AudioServiceKit
 //
-//  Protocol abstraction for audio session management
+//  Protocol abstraction for audio session validation and engine recovery
 //
 
 import Foundation
 import AudioServiceCore
 
-/// Protocol for managing AVAudioSession lifecycle
+/// Protocol for audio session validation and engine recovery
 ///
-/// Abstracts audio session operations to enable dependency injection
-/// and unit testing with mock implementations.
-///
-/// **Responsibility:** Audio session activation and validation only.
-/// SDK does NOT manage audio session category — it validates and reports.
+/// SDK does NOT manage audio session category — app developer does.
+/// This protocol provides:
+/// - Session validation (read-only check)
+/// - Engine recovery (setActive for engine restart)
+/// - Startup validation (check at init)
 protocol AudioSessionManaging: Actor {
-    /// Activate audio session
+    /// Ensure audio session is active (engine recovery)
     /// - Throws: AudioPlayerError if activation fails
-    func activate() async throws
-
-    /// Ensure audio session is active (activate if needed)
-    /// - Throws: AudioPlayerError if activation fails
-    func ensureActive() async throws
-
-    /// Deactivate audio session
-    /// - Throws: AudioPlayerError if deactivation fails
-    func deactivate() async throws
+    func ensureSessionActive() async throws
 
     /// Validate current audio session state without modifying it
     /// - Returns: Validation result indicating session health
     func validateSession() async -> SessionValidationResult
+
+    /// Validate session at player startup
+    /// - Throws: AudioPlayerError if session category is incompatible
+    func validateAtStartup() async throws
 }
